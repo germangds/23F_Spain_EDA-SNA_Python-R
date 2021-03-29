@@ -1,0 +1,635 @@
+---
+title: "23F_Tweets_SNA"
+author: "Group 3"
+date: "24/02/2021"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+#Analysing the networks of words from the 23F Twitter timeline. 
+
+In this R Markdown we'll develop the code used in order to extract the words contained in each of the 30000 tweets extracted during the *23rd of February*, as well as the different transformations performed to convert words into nodes and edges and displaying their relationships.  
+
+# 1. Loading the required libraries
+
+*In this section all the required libraries were loaded, but for the purposes of visualization of the Rmd we did not include its display.*
+```{r Loading packages, echo=FALSE, include=FALSE}
+# Data Wrangling and Visualization
+library(readxl)
+library(glue)
+library(cowplot)
+library(magrittr)
+library(plotly)
+library(tidyverse)
+library(widyr)
+# Date & Time Manipulation.
+library(hms)
+library(lubridate) 
+# Text Mining
+library(tidytext)
+library(tm)
+library(wordcloud)
+# Network Analysis
+library(igraph)
+# Network Visualization (D3.js)
+library(networkD3)
+library(rjson)
+library(dplyr)
+library(ngram)
+```
+
+# 2. Text normalization to remove stop words and weird characters 
+
+```{r}
+data <- read_excel("/Users/ELSA/Desktop/R_and_Py_files/tweets_sna.xlsx")
+data <- data %>% rename(ID=id_str,Created_At=created_at,Text=text)
+
+data_filtered <- data %>% 
+  # Remove column.
+  select(-Created_At) %>% 
+  # Convert to lowercase. 
+  mutate(Text = Text %>% str_to_lower) %>% 
+  # Remove unwanted characters. 
+  mutate(Text= Text %>% str_remove_all(pattern = '\\n')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = '&amp')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = 'https://t.co/[a-z,A-Z,0-9]*')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = 'http://t.co/[a-z,A-Z,0-9]*')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = 'https')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = 'http')) %>% 
+  # Remove hashtags.
+  mutate(Text = Text %>% str_remove_all(pattern = '#[a-z,A-Z]*')) %>% 
+  # Remove accounts.
+  mutate(Text = Text %>% str_remove_all(pattern = '@[a-z,A-Z]*')) %>% 
+  # Remove retweets.
+  mutate(Text = Text %>% str_remove_all(pattern = 'rt [a-z,A-Z]*: ')) %>% 
+  mutate(Text = Text %>% str_remove(pattern = '^(rt)')) %>% 
+  mutate(Text = Text %>% str_remove_all(pattern = '\\_'))
+
+replacement.list <- list('Ã¡' = 'a', 'Ã©' = 'e', 'Ã�' = 'i', 'Ã³' = 'o', 'Ãº' = 'u')
+
+data_filtered %<>% 
+  mutate(Text = chartr(old = names(replacement.list) %>% str_c(collapse = ''), 
+                       new = names(replacement.list) %>% str_c(collapse = ''),
+                       x = Text))
+#Building the corpus
+corpus <-  Corpus(x = VectorSource(x = data_filtered$Text))
+
+tweets.text <- corpus %>% 
+  tm_map(removePunctuation) %>% 
+  tm_map(removeNumbers) %>% 
+  tm_map(removeWords, stopwords('spanish')) %>% 
+  tm_map(PlainTextDocument) %>% 
+  tm_map(stemDocument, 'spanish')
+
+# Recover data into original tibble.
+data_filtered %<>% mutate(Text = tweets.text[[1]]$content)
+
+#Getting Hashtags from tweets
+GetHashtags <- function(tweet) {
+  
+  hashtag.vector <- str_extract_all(string = tweet, pattern = '#\\S+', simplify = TRUE) %>% 
+    as.character()
+  
+  hashtag.string <- NA
+  
+  if (length(hashtag.vector) > 0) {
+    
+    hashtag.string <- hashtag.vector %>% str_c(collapse = ', ')
+    
+  } 
+  
+  return(hashtag.string)
+}
+
+hashtags.df <- tibble(
+  Hashtags = data$Text %>% map_chr(.f = ~ GetHashtags(tweet = .x))
+)
+
+# Remove the shortcut 'q' for 'que'.
+extra.stop.words <- c('q')
+
+stopwords.df <- tibble(
+  word = c(stopwords(kind = 'es'), 
+           # We have some tweets in english.
+           stopwords(kind = 'en'),
+           stopwords(kind = 'fr'),
+           extra.stop.words))
+
+words.df <- data_filtered %>% 
+  unnest_tokens(input = Text, output = word) %>% 
+  anti_join(y = stopwords.df, by = 'word')
+```
+
+
+# 3. Setting up the word count  
+```{r Word count, echo=FALSE}
+word.count <- words.df %>% count(word, sort = TRUE)
+
+word.count %>% head(10)
+```
+# 4. Network Analysis  
+
+## 4.1 Bigram Analysis.  
+```{r Bigram Analysis, echo=FALSE}
+#Creating the data frame
+bi.gram.words <- data_filtered %>% 
+  unnest_tokens(
+    input = Text, 
+    output = bigram, 
+    token = 'ngrams', 
+    n = 2
+  ) %>% 
+  filter(! is.na(bigram))
+
+bi.gram.words %>% 
+  select(bigram) %>% 
+  head(10)
+
+bi.gram.words %<>% 
+  separate(col = bigram, into = c('word1', 'word2'), sep = ' ') %>% 
+  filter(! word1 %in% stopwords.df$word) %>% 
+  filter(! word2 %in% stopwords.df$word) %>% 
+  filter(! is.na(word1)) %>% 
+  filter(! is.na(word2)) 
+
+bi.gram.count <- bi.gram.words %>% 
+  count(word1, word2, sort = TRUE) %>% 
+  # We rename the weight column so that the 
+  # associated network gets the weights (see below).
+  rename(weight = n)
+bi.gram.count %>% head()
+
+#Since we have thousands of words, we need to set up a threshold. 
+threshold <- 300
+
+# For visualization purposes we scale by a global factor. 
+ScaleWeight <- function(x, lambda) {
+  x / lambda
+}
+
+network <-  bi.gram.count %>%
+  filter(weight > threshold) %>%
+  mutate(weight = ScaleWeight(x = weight, lambda = 2E3)) %>% 
+  graph_from_data_frame(directed = FALSE)
+network
+```
+
+### 4.1.2 Visualization of the Network   
+```{r Visualization of network, echo=FALSE}
+
+plot(
+  network, 
+  vertex.size = 1,
+  vertex.label.color = 'black', 
+  vertex.label.cex = 0.7, 
+  vertex.label.dist = 1,
+  edge.color = 'gray', 
+  main = 'Bigram Count Network', 
+  sub = glue('Weight Threshold: {threshold}'), 
+  alpha = 50
+)
+
+# Store the degree.
+V(network)$degree <- strength(graph = network)
+
+# Compute the weight shares.
+E(network)$width <- E(network)$weight/max(E(network)$weight)
+
+plot(
+  network, 
+  vertex.color = 'lightblue',
+  # Scale node size by degree.
+  vertex.size = 2*V(network)$degree,
+  vertex.label.color = 'black', 
+  vertex.label.cex = 0.6, 
+  vertex.label.dist = 1.6,
+  edge.color = 'gray', 
+  # Set edge width proportional to the weight relative value.
+  edge.width = 3*E(network)$width ,
+  main = 'Bigram Count Network', 
+  sub = glue('Weight Threshold: {threshold}'), 
+  alpha = 50
+)
+
+threshold <- 300
+
+network <-  bi.gram.count %>%
+  filter(weight > threshold) %>%
+  graph_from_data_frame(directed = FALSE)
+
+# Store the degree.
+V(network)$degree <- strength(graph = network)
+# Compute the weight shares.
+E(network)$width <- E(network)$weight/max(E(network)$weight)
+
+# Create networkD3 object.
+network.D3 <- igraph_to_networkD3(g = network)
+# Define node size.
+network.D3$nodes %<>% mutate(Degree = (1E-2)*V(network)$degree)
+# Degine color group (I will explore this feature later).
+network.D3$nodes %<>% mutate(Group = 1)
+# Define edges width. 
+network.D3$links$Width <- 10*E(network)$width
+
+forceNetwork(
+  Links = network.D3$links, 
+  Nodes = network.D3$nodes, 
+  Source = 'source', 
+  Target = 'target',
+  NodeID = 'name',
+  Group = 'Group', 
+  opacity = 0.9,
+  Value = 'Width',
+  Nodesize = 'Degree', 
+  # We input a JavaScript function.
+  linkWidth = JS("function(d) { return Math.sqrt(d.value); }"), 
+  fontSize = 12,
+  zoom = TRUE, 
+  opacityNoHover = 1
+)
+
+# Get all connected components.
+
+clusters(graph = network)
+# Select biggest connected component.  
+V(network)$cluster <- clusters(graph = network)$membership
+
+cc.network <- induced_subgraph(
+  graph = network,
+  vids = which(V(network)$cluster == which.max(clusters(graph = network)$csize))
+)
+
+cc.network 
+# Store the degree.
+V(cc.network)$degree <- strength(graph = cc.network)
+
+# Compute the weight shares.
+E(cc.network)$width <- E(cc.network)$weight/max(E(cc.network)$weight)
+
+
+ #Decrease threshold to get a more complex network
+
+# Treshold
+threshold <- 150
+
+network <-  bi.gram.count %>%
+  filter(weight > threshold) %>%
+  graph_from_data_frame(directed = FALSE)
+
+# Store the degree.
+V(network)$degree <- strength(graph = network)
+# Compute the weight shares.
+E(network)$width <- E(network)$weight/max(E(network)$weight)
+
+
+# Create networkD3 object.
+network.D3 <- igraph_to_networkD3(g = network)
+# Define node size.
+network.D3$nodes %<>% mutate(Degree = (1E-2)*V(network)$degree)
+# Degine color group (I will explore this feature later).
+network.D3$nodes %<>% mutate(Group = 1)
+# Define edges width. 
+network.D3$links$Width <- 10*E(network)$width
+
+forceNetwork(
+  Links = network.D3$links, 
+  Nodes = network.D3$nodes, 
+  Source = 'source', 
+  Target = 'target',
+  NodeID = 'name',
+  Group = 'Group', 
+  opacity = 0.9,
+  Value = 'Width',
+  Nodesize = 'Degree', 
+  # We input a JavaScript function.
+  linkWidth = JS("function(d) { return Math.sqrt(d.value); }"), 
+  fontSize = 12,
+  zoom = TRUE, 
+  opacityNoHover = 1
+)
+
+```
+
+### 4.1.3 Node importance –centrality measures 
+```{r Node importance Bigram, echo=FALSE}
+#Node Importance
+
+# Compute the centrality measures.
+node.impo.df <- tibble(
+  word = V(cc.network)$name,  
+  degree = strength(graph = cc.network),
+  closeness = closeness(graph = cc.network), 
+  betweenness = betweenness(graph = cc.network))
+
+# Compute the average centrality measures.
+
+node.impo.df.mean <- tibble(
+  degree = mean(strength(graph = cc.network)),
+  closeness = mean(closeness(graph = cc.network)), 
+  betweenness = mean(betweenness(graph = cc.network)),
+  transitivity = transitivity(graph = cc.network))
+
+node.impo.df.mean
+
+#Distribution of centralities
+
+plt.deg <- node.impo.df %>% 
+  ggplot(mapping = aes(x = degree)) +
+  theme_light() +
+  geom_histogram(fill = 'blue', alpha = 0.8, bins = 30)
+
+plt.clo <- node.impo.df %>% 
+  ggplot(mapping = aes(x = closeness)) +
+  theme_light() +
+  geom_histogram(fill = 'red', alpha = 0.8, bins = 30)
+
+plt.bet <- node.impo.df %>% 
+  ggplot(mapping = aes(x = betweenness)) +
+  theme_light() +
+  geom_histogram(fill = 'green4', alpha = 0.8, bins = 30)
+
+plot_grid(
+  ... = plt.deg, 
+  plt.clo, 
+  plt.bet, 
+  ncol = 1, 
+  align = 'v'
+)
+```
+
+## 4.2 Skip-gram Analysis 
+
+### 4.2.1 Network definition Skip-gram Analysis. 
+```{r Network definition Skip-gram Analysis, echo=FALSE}
+###Skip-gram Analysis
+
+skip.window <- 2
+
+skip.gram.words <- data_filtered %>% 
+  unnest_tokens(
+    input = Text, 
+    output = skipgram, 
+    token ='skip_ngrams', 
+    n = skip.window
+  ) %>% 
+  filter(! is.na(skipgram))
+
+skip.gram.words$num_words <- skip.gram.words$skipgram %>% 
+  map_int(.f = ~ ngram::wordcount(.x))
+
+skip.gram.words %<>% filter(num_words == 2) %>% select(- num_words)
+
+skip.gram.words %<>% 
+  separate(col = skipgram, into = c('word1', 'word2'), sep = ' ') %>% 
+  filter(! word1 %in% stopwords.df$word) %>% 
+  filter(! word2 %in% stopwords.df$word) %>% 
+  filter(! is.na(word1)) %>% 
+  filter(! is.na(word2)) 
+
+skip.gram.count <- skip.gram.words  %>% 
+  count(word1, word2, sort = TRUE) %>% 
+  rename(weight = n)
+
+skip.gram.count %>% head()
+```
+
+### 4.2.2 Visualization of the Network   
+```{r Visualization of the Network, echo=FALSE}
+#Visualization
+
+# Treshold
+threshold <- 200
+
+network <-  skip.gram.count %>%
+  filter(weight > threshold) %>%
+  graph_from_data_frame(directed = FALSE)
+
+# Select biggest connected component.  
+V(network)$cluster <- clusters(graph = network)$membership
+
+cc.network <- induced_subgraph(
+  graph = network,
+  vids = which(V(network)$cluster == which.max(clusters(graph = network)$csize))
+)
+
+# Store the degree.
+V(cc.network)$degree <- strength(graph = cc.network)
+# Compute the weight shares.
+E(cc.network)$width <- E(cc.network)$weight/max(E(cc.network)$weight)
+
+# Create networkD3 object.
+network.D3 <- igraph_to_networkD3(g = cc.network)
+# Define node size.
+network.D3$nodes %<>% mutate(Degree = (1E-2)*V(cc.network)$degree)
+# Degine color group (I will explore this feature later).
+network.D3$nodes %<>% mutate(Group = 1)
+# Define edges width. 
+network.D3$links$Width <- 10*E(cc.network)$width
+
+forceNetwork(
+  Links = network.D3$links, 
+  Nodes = network.D3$nodes, 
+  Source = 'source', 
+  Target = 'target',
+  NodeID = 'name',
+  Group = 'Group', 
+  opacity = 0.9,
+  Value = 'Width',
+  Nodesize = 'Degree', 
+  # We input a JavaScript function.
+  linkWidth = JS("function(d) { return Math.sqrt(d.value); }"), 
+  fontSize = 12,
+  zoom = TRUE, 
+  opacityNoHover = 1
+)
+```
+
+### 4.2.3 Node importance –centrality measures 
+```{r Node importance Skipgram, echo=FALSE}
+#Node Importance (ii)
+
+# Compute the centrality measures.
+node.impo.df <- tibble(
+  word = V(cc.network)$name,  
+  degree = strength(graph = cc.network),
+  closeness = closeness(graph = cc.network), 
+  betweenness = betweenness(graph = cc.network))
+
+
+# Compute the average centrality measures.
+
+node.impo.df.mean <- tibble(
+  degree = mean(strength(graph = cc.network)),
+  closeness = mean(closeness(graph = cc.network)), 
+  betweenness = mean(betweenness(graph = cc.network)),
+  transitivity = transitivity(graph = cc.network))
+
+
+node.impo.df.mean
+
+#Distribution of centralities(ii)
+
+plt.deg <- node.impo.df %>% 
+  ggplot(mapping = aes(x = degree)) +
+  theme_light() +
+  geom_histogram(fill = 'blue', alpha = 0.8, bins = 30)
+
+plt.clo <- node.impo.df %>% 
+  ggplot(mapping = aes(x = closeness)) +
+  theme_light() +
+  geom_histogram(fill = 'red', alpha = 0.8, bins = 30)
+
+plt.bet <- node.impo.df %>% 
+  ggplot(mapping = aes(x = betweenness)) +
+  theme_light() +
+  geom_histogram(fill = 'green4', alpha = 0.8, bins = 30)
+
+plot_grid(
+  ... = plt.deg, 
+  plt.clo, 
+  plt.bet, 
+  ncol = 1, 
+  align = 'v')
+```
+
+### 4.2.4. Community detection  
+```{r Community detection Skip gram, echo=FALSE}
+#Community detection.
+
+comm.det.obj <- cluster_louvain(
+  graph = cc.network, 
+  weights = E(cc.network)$weight
+)
+
+comm.det.obj
+
+
+V(cc.network)$membership <- membership(comm.det.obj)
+
+# We use the membership label to color the nodes.
+network.D3$nodes$Group <- V(cc.network)$membership
+
+forceNetwork(
+  Links = network.D3$links, 
+  Nodes = network.D3$nodes, 
+  Source = 'source', 
+  Target = 'target',
+  NodeID = 'name',
+  Group = 'Group', 
+  opacity = 0.9,
+  Value = 'Width',
+  Nodesize = 'Degree', 
+  # We input a JavaScript function.
+  linkWidth = JS("function(d) { return Math.sqrt(d.value); }"), 
+  fontSize = 12,
+  zoom = TRUE, 
+  opacityNoHover = 1
+)
+
+#Collecting words per cluster.
+
+membership.df <- tibble(
+  word = V(cc.network) %>% names(),
+  cluster = V(cc.network)$membership
+)
+
+V(cc.network)$membership %>%
+  unique %>% 
+  sort %>% 
+  map_chr(.f = function(cluster.id) {
+    
+    membership.df %>% 
+      filter(cluster == cluster.id) %>% 
+      # Get 15 at most 15 words per cluster.
+      slice(1:15) %>% 
+      pull(word) %>% 
+      str_c(collapse = ', ')
+    
+  }) 
+```
+# 5. Correlation Analysis 
+
+## 5.1 Network definition Correlation Analysis.  
+```{r Network definition Correlation Analysis, echo=FALSE}
+
+##Correlation analysis (Phi Coefficient) 
+
+#Network Definition Correlation Analysis
+
+cor.words <- words.df %>% 
+  group_by(word) %>% 
+  filter(n() > 10) %>% 
+  pairwise_cor(item = word, feature = ID) 
+
+as_tibble(cor.words)
+```
+## 5.2 Visualization of the Network
+
+```{r}
+
+#Visualization
+
+#Setting up topic words based on the EDA performed in Python. 
+
+topic.words <- c('rey', 'democracia', 'golpe')
+
+# Set correlation threshold. 
+threshold = 0.1
+
+network <- cor.words %>%
+  rename(weight = correlation) %>% 
+  # filter for relevant nodes.
+  filter((item1 %in% topic.words | item2 %in% topic.words)) %>% 
+  filter(weight > threshold) %>%
+  graph_from_data_frame()
+
+V(network)$degree <- strength(graph = network)
+
+E(network)$width <- E(network)$weight/max(E(network)$weight)
+
+network.D3 <- igraph_to_networkD3(g = network)
+
+network.D3$nodes %<>% mutate(Degree = 5*V(network)$degree)
+
+# Define color groups. 
+network.D3$nodes$Group <- network.D3$nodes$name %>% 
+  as.character() %>% 
+  map_dbl(.f = function(name) {
+    index <- which(name == topic.words) 
+    ifelse(
+      test = length(index) > 0,
+      yes = index, 
+      no = 0
+    )
+  }
+  )
+
+network.D3$links %<>% mutate(Width = 10*E(network)$width)
+
+forceNetwork(
+  Links = network.D3$links, 
+  Nodes = network.D3$nodes, 
+  Source = 'source', 
+  Target = 'target',
+  NodeID = 'name',
+  Group = 'Group', 
+  # We color the nodes using JavaScript code.
+  colourScale = JS('d3.scaleOrdinal().domain([0,1,2]).range(["gray", "blue", "red", "black"])'), 
+  opacity = 0.8,
+  Value = 'Width',
+  Nodesize = 'Degree', 
+  # We define edge properties using JavaScript code.
+  linkWidth = JS("function(d) { return Math.sqrt(d.value); }"), 
+  linkDistance = JS("function(d) { return 550/(d.value + 1); }"), 
+  fontSize = 18,
+  zoom = TRUE, 
+  opacityNoHover = 1
+)
+```
